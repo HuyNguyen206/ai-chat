@@ -35,4 +35,10 @@ return [
         ],
     ],
 
+    'gemini' => [
+        'api_key' => env('GEMINI_API_KEY'),
+        // flash-lite is on the free tier and far less often overloaded (503) than full Flash
+        'model' => env('GEMINI_MODEL', 'gemini-flash-lite-latest'),
+    ],
+
 ];
