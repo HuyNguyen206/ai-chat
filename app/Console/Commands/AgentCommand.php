@@ -64,20 +64,24 @@ class AgentCommand extends Command
             dump($response);
 
             if (!empty($response['candidates'][0]['content']['parts'][0]['functionCall'])) {
-                $function = $response['candidates'][0]['content']['parts'][0]['functionCall'];
+                $part = $response['candidates'][0]['content']['parts'][0];
+                $function = $part['functionCall'];
 
-                $result = $this->{$function['name']}(...$function['args']);
+                $result = $this->{$function['name']}(...($function['args'] ?? []));
 
-                unset($function['args']);
-                $this->history[] = ['role' => 'model', 'parts' => [[
-                    'functionCall' => $function,
-                    'thoughtSignature' => $response['candidates'][0]['content']['parts'][0]['thoughtSignature'],
-                ]]];
-                $this->history[] = ['role' => 'user', 'parts' => [['functionResponse' => [
-                    'id' => $function['id'],
+                // Send the model's function-call part back exactly as received
+                // (keeps args, id and thoughtSignature intact).
+                $this->history[] = ['role' => 'model', 'parts' => [$part]];
+
+                // functionResponse.response must be a JSON object (Struct), not a scalar.
+                $functionResponse = [
                     'name' => $function['name'],
-                    'response' => $result
-                ]]]];
+                    'response' => ['result' => $result],
+                ];
+                if (isset($function['id'])) {
+                    $functionResponse['id'] = $function['id'];
+                }
+                $this->history[] = ['role' => 'user', 'parts' => [['functionResponse' => $functionResponse]]];
 
             } else {
                 $aiResponseMessage = $response['candidates'][0]['content']['parts'][0]['text'] ?? 'No response from Gemini.';
