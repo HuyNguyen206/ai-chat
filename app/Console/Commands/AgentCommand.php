@@ -70,7 +70,9 @@ class AgentCommand extends Command
                 $result = $this->{$function['name']}(...($function['args'] ?? []));
 
                 // Send the model's function-call part back exactly as received
-                // (keeps args, id and thoughtSignature intact).
+                // (keeps args, id and thoughtSignature intact). `args` must stay a JSON
+                // object: an empty PHP array would be encoded as `[]` instead of `{}`.
+                $part['functionCall']['args'] = (object) ($function['args'] ?? []);
                 $this->history[] = ['role' => 'model', 'parts' => [$part]];
 
                 // functionResponse.response must be a JSON object (Struct), not a scalar.
