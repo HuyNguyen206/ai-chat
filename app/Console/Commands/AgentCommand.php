@@ -5,6 +5,7 @@ namespace App\Console\Commands;
 use Illuminate\Console\Command;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use function Laravel\Prompts\spin;
 use function Laravel\Prompts\text;
 
@@ -38,65 +39,57 @@ class AgentCommand extends Command
     public function handle(): int
     {
         while (true) {
+            $message = text('Message', required: true);
+            $this->history[] = ['role' => 'user', 'parts' => [['text' => $message]]];
 
-            if (!isset($result)) {
-                $message = text('Message', required: true);
-                $this->history[] = ['role' => 'user', 'parts' => [['text' => $message]]];
-            } else {
-                $result = null;
-            }
-
-            $response = spin(fn() => Http::withHeaders(['x-goog-api-key' => config('services.gemini.api_key')])
-                ->timeout(60)
-                ->post(sprintf(
-                    'https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent',
-                    config('services.gemini.model'),
-                ), [
-                        'contents' => $this->history,
-                        'tools' => $this->tools(),
-                    ]
-                )
-                ->throw()
-                ->json(),
-                'Running...'
-            );
+            $response = $this->callAI();
 
             dump($response);
 
-            if (!empty($response['candidates'][0]['content']['parts'][0]['functionCall'])) {
-                $part = $response['candidates'][0]['content']['parts'][0];
-                $function = $part['functionCall'];
+            $innerLoopApiCallCount = 0;
+            $callToolCount = 0;
 
-                $result = $this->{$function['name']}(...($function['args'] ?? []));
+            while (($functionCalls = $this->getFunctionCall($response)) && $functionCalls->isNotEmpty()) {
+                $innerLoopApiCallCount++;
 
-                // Send the model's function-call part back exactly as received
-                // (keeps args, id and thoughtSignature intact). `args` must stay a JSON
-                // object: an empty PHP array would be encoded as `[]` instead of `{}`.
-                $part['functionCall']['args'] = (object) ($function['args'] ?? []);
-                $this->history[] = ['role' => 'model', 'parts' => [$part]];
-
-                // functionResponse.response must be a JSON object (Struct), not a scalar.
-                $functionResponse = [
-                    'name' => $function['name'],
-                    'response' => ['result' => $result],
-                ];
-                if (isset($function['id'])) {
-                    $functionResponse['id'] = $function['id'];
+                $parts = $response['candidates'][0]['content']['parts'];
+                foreach ($parts as $index => $part) {
+                    if (isset($part['functionCall']['args'])) {
+                        $part['functionCall']['args'] = (object) ($function['args'] ?? []);
+                    }
+                    $parts[$index] = $part;
                 }
-                $this->history[] = ['role' => 'user', 'parts' => [['functionResponse' => $functionResponse]]];
+                $this->history[] = ['role' => 'model', 'parts' => $parts];
 
-            } else {
+                $functionCalls->each(function($functionCall) use (&$callToolCount) {
+                    $callToolCount++;
+                    $function = $functionCall['functionCall'];
+
+                    $result = $this->{$function['name']}(...($function['args'] ?? []));
+
+                    $functionResponse = [
+                        'name' => $function['name'],
+                        'response' => ['result' => $result],
+                    ];
+                    if (isset($function['id'])) {
+                        $functionResponse['id'] = $function['id'];
+                    }
+                    $this->history[] = ['role' => 'user', 'parts' => [['functionResponse' => $functionResponse]]];
+                    $this->info('This tool has been called: ' . $function['name']);
+                });
+
+                $response = $this->callAI();
+
+                dump($response);
+            }
+
                 $aiResponseMessage = $response['candidates'][0]['content']['parts'][0]['text'] ?? 'No response from Gemini.';
                 $this->history[] = ['role' => 'model', 'parts' => [['text' => $aiResponseMessage]]];
                 $this->info($aiResponseMessage);
-
-                $result = null;
-            }
+                $this->info('Inner loop Api Call Count: ' . $innerLoopApiCallCount);
+                $this->info('Total call Tool Count: ' . $callToolCount);
 
         }
-
-
-        return self::SUCCESS;
     }
 
     protected function tools(): array
@@ -116,13 +109,24 @@ class AgentCommand extends Command
                 ],
                 [
                     'name'        => 'add_log',
-                    'description' => 'Add a log entry.',
+                    'description' => 'Add a message to log.',
                     'parameters'  => [
                         'type'       => 'object',
                         'properties' => [
                             'logMessage' => ['type' => 'string', 'description' => 'The log message to add'],
                         ],
                         'required' => ['logMessage'],
+                    ],
+                ],
+                [
+                    'name'        => 'read_file_content',
+                    'description' => 'Read the content of a file.',
+                    'parameters'  => [
+                        'type'       => 'object',
+                        'properties' => [
+                            'filePath' => ['type' => 'string', 'description' => 'The path to the file to read'],
+                        ],
+                        'required' => ['filePath'],
                     ],
                 ],
                 // more functions...
@@ -133,5 +137,47 @@ class AgentCommand extends Command
     public function get_current_time()
     {
         return now()->toDateTimeString() . '|Vietnam time';
+    }
+
+    public function add_log(string $logMessage)
+    {
+        Log::info('Agent log: ' . $logMessage);
+    }
+
+    public function read_file_content(string $filePath)
+    {
+        return file_get_contents(base_path($filePath));
+    }
+
+    /**
+     * @return mixed
+     */
+    public function callAI(): mixed
+    {
+        $response = spin(fn() => Http::withHeaders(['x-goog-api-key' => config('services.gemini.api_key')])
+            ->timeout(60)
+            ->post(sprintf(
+                'https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent',
+                config('services.gemini.model'),
+            ), [
+                    'contents' => $this->history,
+                    'tools' => $this->tools(),
+                ]
+            )
+            ->throw()
+            ->json(),
+            'Running...'
+        );
+        return $response;
+    }
+
+    public function getFunctionCall($response)
+    {
+        $parts = $response['candidates'][0]['content']['parts'];
+
+        return collect($parts)
+            ->filter(function($functionCall) {
+                return !empty($functionCall['functionCall']);
+            });
     }
 }
